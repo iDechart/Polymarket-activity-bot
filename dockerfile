@@ -5,12 +5,15 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# зависимости
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends curl \
+ && rm -rf /var/lib/apt/lists/*
+
 RUN pip install --no-cache-dir httpx sqlalchemy aiosqlite
 
 COPY app/ /app/
-
-# папка под volume с БД
 RUN mkdir -p /data
+
+EXPOSE 8080
 
 CMD ["python", "main.py"]
