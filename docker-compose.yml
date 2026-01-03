@@ -1,0 +1,9 @@
+services:
+  polymarket-activity-bot:
+    build: .
+    container_name: polymarket-activity-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/data
