@@ -1,6 +1,7 @@
 import os
 import asyncio
 import json
+import time
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -19,6 +20,11 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 DATA_API_BASE = "https://data-api.polymarket.com"
 
+# health state (обновляем в рантайме)
+START_TS = time.time()
+LAST_SUCCESS_TS: float = 0.0
+LAST_ERROR: str = ""
+
 
 def env(name: str, default: Optional[str] = None) -> str:
     v = os.getenv(name, default)
@@ -28,14 +34,12 @@ def env(name: str, default: Optional[str] = None) -> str:
 
 
 def build_db(db_path: str) -> Table:
-    # SQLite настройки для скорости + надёжности в контейнере
     engine = create_engine(f"sqlite:///{db_path}", future=True)
     with engine.connect() as conn:
         conn.exec_driver_sql("PRAGMA journal_mode=WAL;")
         conn.exec_driver_sql("PRAGMA synchronous=NORMAL;")
 
     md = MetaData()
-
     activity = Table(
         "polymarket_activity",
         md,
@@ -57,7 +61,6 @@ def build_db(db_path: str) -> Table:
         Column("icon", Text),
         Column("raw_json", Text),
     )
-
     md.create_all(engine)
     return activity
 
@@ -127,14 +130,77 @@ def format_message(r: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-async def run() -> None:
+async def health_server(host: str, port: int, grace_sec: int) -> None:
+    """
+    Очень лёгкий HTTP сервер без зависимостей.
+    /healthz -> 200 если были успешные циклы поллинга (или идёт grace period), иначе 503
+    /readyz  -> 200 если был хотя бы один успешный запрос к data-api
+    """
+    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        global LAST_SUCCESS_TS, LAST_ERROR
+
+        try:
+            data = await reader.read(1024)
+            line = data.split(b"\r\n", 1)[0].decode("utf-8", "ignore")
+            parts = line.split(" ")
+            path = parts[1] if len(parts) >= 2 else "/"
+
+            now = time.time()
+            in_grace = (now - START_TS) < grace_sec
+            ok = (LAST_SUCCESS_TS > 0) or in_grace
+
+            if path.startswith("/readyz"):
+                ready_ok = LAST_SUCCESS_TS > 0
+                status = 200 if ready_ok else 503
+                body = json.dumps(
+                    {"ready": ready_ok, "last_success_ts": LAST_SUCCESS_TS, "last_error": LAST_ERROR},
+                    ensure_ascii=False,
+                ).encode()
+            else:  # /healthz и всё остальное
+                status = 200 if ok else 503
+                body = json.dumps(
+                    {
+                        "ok": ok,
+                        "grace": in_grace,
+                        "uptime_sec": int(now - START_TS),
+                        "last_success_ts": LAST_SUCCESS_TS,
+                        "last_error": LAST_ERROR,
+                    },
+                    ensure_ascii=False,
+                ).encode()
+
+            reason = "OK" if status == 200 else "SERVICE UNAVAILABLE"
+            resp = (
+                f"HTTP/1.1 {status} {reason}\r\n"
+                "Content-Type: application/json\r\n"
+                f"Content-Length: {len(body)}\r\n"
+                "Connection: close\r\n"
+                "\r\n"
+            ).encode() + body
+
+            writer.write(resp)
+            await writer.drain()
+        finally:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+    server = await asyncio.start_server(handle, host, port)
+    async with server:
+        await server.serve_forever()
+
+
+async def poll_loop() -> None:
+    global LAST_SUCCESS_TS, LAST_ERROR
+
     user = env("POLY_USER")
     bot_token = env("TELEGRAM_BOT_TOKEN")
     chat_id = env("TELEGRAM_CHAT_ID")
 
     poll_interval = int(env("POLL_INTERVAL_SEC", "15"))
     limit = int(env("LIMIT", "100"))
-
     db_path = env("DB_PATH", "/data/polymarket.sqlite3")
 
     activity = build_db(db_path)
@@ -142,7 +208,6 @@ async def run() -> None:
 
     headers = {"User-Agent": "polymarket-activity-ingestor/1.0"}
     async with httpx.AsyncClient(headers=headers) as http:
-        # единый клиент и для телеги, чтобы не создавать каждый раз
         async with httpx.AsyncClient() as tg:
             while True:
                 try:
@@ -155,7 +220,6 @@ async def run() -> None:
                             tx = row["transactionHash"]
                             if not tx:
                                 continue
-
                             stmt = sqlite_insert(activity).values(**row).on_conflict_do_nothing(
                                 index_elements=["transactionHash"]
                             )
@@ -163,22 +227,33 @@ async def run() -> None:
                             if res.rowcount == 1:
                                 new_rows.append(row)
 
-                    # Чтобы не “переворачивать” события, шлём от старых к новым
                     new_rows.sort(key=lambda x: x.get("timestamp") or 0)
-
-                    # Если новых много — можно объединить, но пока шлём по одному
                     for r in new_rows:
                         await telegram_send(tg, bot_token, chat_id, format_message(r))
 
+                    LAST_SUCCESS_TS = time.time()
+                    LAST_ERROR = ""
+
                 except Exception as e:
-                    # не урони сервис из-за одной ошибки
+                    LAST_ERROR = f"{type(e).__name__}: {e}"
                     try:
-                        await telegram_send(tg, bot_token, chat_id, f"⚠️ Error: {type(e).__name__}: {e}")
+                        await telegram_send(tg, bot_token, chat_id, f"⚠️ Error: {LAST_ERROR}")
                     except Exception:
                         pass
 
                 await asyncio.sleep(poll_interval)
 
 
+async def main() -> None:
+    health_host = env("HEALTH_HOST", "0.0.0.0")
+    health_port = int(env("HEALTH_PORT", "8080"))
+    grace_sec = int(env("HEALTH_GRACE_SEC", "120"))
+
+    await asyncio.gather(
+        poll_loop(),
+        health_server(health_host, health_port, grace_sec),
+    )
+
+
 if __name__ == "__main__":
-    asyncio.run(run())
+    asyncio.run(main())
