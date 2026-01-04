@@ -122,8 +122,8 @@ def format_message(r: Dict[str, Any]) -> str:
     lines = ["🆕 Polymarket activity"]
     if title:
         lines.append(f"📝 {title}")
-    if outcome is not None:
-        outcome = "$$$"
+    #if outcome is not None:
+    #    outcome = "$$$"
     lines.append(f"🔁 {typ} / {side} / {outcome}")
     if size is not None or usdc is not None:
         lines.append(f"📦 size={size} | usdc={usdc}")
