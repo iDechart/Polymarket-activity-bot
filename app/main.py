@@ -113,6 +113,7 @@ def format_message(r: Dict[str, Any]) -> str:
     title = (r.get("title") or "").strip()
     typ = r.get("type")
     side = r.get("side")
+    outcome = r.get("outcome")
     price = r.get("price")
     size = r.get("size")
     usdc = r.get("usdcSize")
@@ -121,7 +122,9 @@ def format_message(r: Dict[str, Any]) -> str:
     lines = ["🆕 Polymarket activity"]
     if title:
         lines.append(f"📝 {title}")
-    lines.append(f"🔁 {typ} / {side}")
+    if outcome is not None:
+        outcome = "$$$"
+    lines.append(f"🔁 {typ} / {side} / {outcome}")
     if size is not None or usdc is not None:
         lines.append(f"📦 size={size} | usdc={usdc}")
     if price is not None:
